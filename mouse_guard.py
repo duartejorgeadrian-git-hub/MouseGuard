@@ -1,317 +1,332 @@
-import time
-import sys
 import os
-import argparse
+import sys
+import time
+import json
 import logging
 import threading
-import json
+import ctypes
+import queue
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
-from pynput import mouse
+from tkinter import ttk, filedialog, messagebox
+import pystray
+from PIL import Image
+import pynput
 
-try:
-    import pystray
-    from PIL import Image
-    HAS_TRAY = True
-except ImportError:
-    HAS_TRAY = False
-
-try:
-    import comtypes.client
-    from comtypes import CoInitialize
-except ImportError:
-    pass
-
-try:
-    from ctypes import cast, POINTER
-    from comtypes import CLSCTX_ALL
-    from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
-    HAS_PYCAW = True
-except ImportError:
-    HAS_PYCAW = False
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 CONFIG_FILE = "config.json"
 
 def resource_path(relative_path):
-    """ Obtener la ruta absoluta del recurso, compatible con PyInstaller """
     try:
         base_path = sys._MEIPASS
     except Exception:
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
 
-DEFAULT_AUDIO = resource_path("purge_siren.mp3")
+DEFAULT_AUDIO = ""
 ICON_PATH = resource_path("icon.ico")
 
-class MouseGuard:
-    def __init__(self, use_console=False):
-        self.use_tray = not use_console and HAS_TRAY
-        self.ultimo_movimiento = time.time()
-        self.listener = None
-        self.corriendo = False
-        
-        # Valores por defecto
-        self.umbral = 60
+class MouseGuardApp:
+    def __init__(self):
+        self.umbral = 5
         self.audio_personalizado = DEFAULT_AUDIO
         self.repeticiones = 1
-
-        self._configurar_logging()
+        
+        self.corriendo = True
+        self.alarma_activa = False
+        self.ultimo_movimiento = time.time()
+        
+        self.cola_gui = queue.Queue()
         self.cargar_configuracion()
-
-    def _configurar_logging(self):
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s [%(levelname)s] %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S',
-            filename='mouseguard_debug.log',
-            filemode='a'
+        
+        # Iniciar hilos en segundo plano
+        self.listener = pynput.mouse.Listener(on_move=self.on_move, on_click=self.on_click, on_scroll=self.on_scroll)
+        self.listener.start()
+        
+        self.hilo_monitoreo = threading.Thread(target=self._bucle_monitoreo, daemon=True)
+        self.hilo_monitoreo.start()
+        
+        self.hilo_tray = threading.Thread(target=self._bucle_tray, daemon=True)
+        self.hilo_tray.start()
+        
+        # Inicializar GUI principal
+        self.root = tk.Tk()
+        self.root.title("MouseGuard - Configuración")
+        self.root.geometry("450x450") # Mas alto
+        self.root.resizable(True, True) # Permitir redimensionar
+        
+        try:
+            self.root.iconbitmap(ICON_PATH)
+        except:
+            pass
+            
+        self._setup_gui()
+        self.root.protocol("WM_DELETE_WINDOW", self.ocultar_ventana)
+        
+        # Verificar cola para comunicación entre hilos
+        self.root.after(100, self._verificar_cola)
+        
+        # Centrar ventana
+        self.root.eval('tk::PlaceWindow . center')
+        
+        # Si ya había config, ocultamos inicialmente (para iniciar silenciado en tray)
+        if os.path.exists(CONFIG_FILE):
+            self.root.withdraw()
+            
+    def _setup_gui(self):
+        style = ttk.Style()
+        try:
+            style.theme_use('clam')
+        except:
+            pass
+        
+        main_frame = ttk.Frame(self.root, padding=20)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        ttk.Label(main_frame, text="Configuración de MouseGuard", font=("Arial", 14, "bold")).pack(pady=(0, 20))
+        
+        # Tiempo de Inactividad
+        frame_tiempo = ttk.LabelFrame(main_frame, text="Tiempo de Inactividad", padding=10)
+        frame_tiempo.pack(fill=tk.X, pady=5)
+        
+        self.lbl_umbral = ttk.Label(frame_tiempo, text=f"{self.umbral} Segundos")
+        self.lbl_umbral.pack(side=tk.LEFT, padx=5)
+        
+        self.val_umbral = tk.IntVar(value=self.umbral)
+        slider_umbral = ttk.Scale(frame_tiempo, from_=1, to=3600, orient=tk.HORIZONTAL, variable=self.val_umbral, command=self._actualizar_lbl_umbral)
+        slider_umbral.pack(fill=tk.X, expand=True, padx=5)
+        
+        # Audio
+        frame_audio = ttk.LabelFrame(main_frame, text="Sonido de Alerta", padding=10)
+        frame_audio.pack(fill=tk.X, pady=5)
+        
+        self.val_audio = tk.StringVar(value=os.path.basename(self.audio_personalizado))
+        ttk.Label(frame_audio, textvariable=self.val_audio, width=30).pack(side=tk.LEFT, padx=5)
+        ttk.Button(frame_audio, text="Examinar...", command=self._seleccionar_audio).pack(side=tk.RIGHT, padx=5)
+        
+        # Repeticiones
+        frame_rep = ttk.LabelFrame(main_frame, text="Intensidad (Repeticiones)", padding=10)
+        frame_rep.pack(fill=tk.X, pady=5)
+        
+        self.lbl_rep = ttk.Label(frame_rep, text=f"{self.repeticiones} Veces")
+        self.lbl_rep.pack(side=tk.LEFT, padx=5)
+        
+        self.val_rep = tk.IntVar(value=self.repeticiones)
+        slider_rep = ttk.Scale(frame_rep, from_=1, to=20, orient=tk.HORIZONTAL, variable=self.val_rep, command=self._actualizar_lbl_rep)
+        slider_rep.pack(fill=tk.X, expand=True, padx=5)
+        
+        # Boton Guardar y Manual
+        botones_frame = ttk.Frame(main_frame)
+        botones_frame.pack(fill=tk.X, pady=15)
+        
+        ttk.Button(botones_frame, text="Ver Manual", command=self.mostrar_manual).pack(side=tk.LEFT, expand=True, padx=5)
+        ttk.Button(botones_frame, text="Guardar y Minimizar a Bandeja", command=self.guardar_y_ocultar).pack(side=tk.RIGHT, expand=True, padx=5)
+        
+    def _actualizar_lbl_umbral(self, *args):
+        self.lbl_umbral.config(text=f"{self.val_umbral.get()} Segundos")
+        
+    def _actualizar_lbl_rep(self, *args):
+        self.lbl_rep.config(text=f"{self.val_rep.get()} Veces")
+        
+    def _seleccionar_audio(self):
+        filepath = filedialog.askopenfilename(
+            title="Seleccionar Sonido",
+            filetypes=[("Archivos de Audio", "*.wav *.mp3 *.aiff *.ogg"), ("Todos", "*.*")]
         )
+        if filepath:
+            self.audio_personalizado = filepath
+            self.val_audio.set(os.path.basename(filepath))
+            
+    def guardar_y_ocultar(self):
+        self.umbral = self.val_umbral.get()
+        self.repeticiones = self.val_rep.get()
+        
+        data = {
+            "umbral": self.umbral,
+            "audio": self.audio_personalizado,
+            "repeticiones": self.repeticiones
+        }
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4)
+            
+        logging.info("Configuracion guardada correctamente.")
+        self.ultimo_movimiento = time.time()
+        self.alarma_activa = False
+        self.ocultar_ventana()
+        
+    def mostrar_manual(self):
+        man = tk.Toplevel(self.root)
+        man.title("Manual de Uso - MouseGuard")
+        man.geometry("500x400")
+        man.resizable(False, False)
+        try:
+            man.iconbitmap(ICON_PATH)
+        except:
+            pass
+            
+        text = tk.Text(man, wrap=tk.WORD, font=("Arial", 10), padx=10, pady=10)
+        text.pack(fill=tk.BOTH, expand=True)
+        manual_content = """=== MANUAL DE USO DE MOUSEGUARD ===
+
+1. TIEMPO DE INACTIVIDAD
+Define cuántos segundos pueden pasar sin que se mueva el mouse antes de que se dispare la alarma. 
+
+2. SONIDO DE ALERTA
+Por defecto se incluye una sirena. Si descargaste 'The purge siren.mp3' o cualquier otro archivo, usa el botón 'Examinar...' para seleccionarlo. ¡Soporta MP3 y WAV!
+
+3. INTENSIDAD (REPETICIONES)
+Si tu sonido es muy corto (ej: un beep de 1 segundo), puedes aumentar las repeticiones para que suene varias veces seguidas. Si es un archivo largo como la sirena de la purga, con 1 repetición es suficiente.
+
+4. MODO INVISIBLE (BANDEJA DEL SISTEMA)
+Al hacer clic en 'Guardar y Minimizar a Bandeja', el programa se esconderá. Verás su ícono (un escudo) junto a la hora de Windows. Si necesitas volver a configurar algo o detener el programa, haz clic derecho sobre ese ícono.
+
+NOTA: El programa forzará el volumen de tu PC al 100% justo antes de hacer sonar la alarma, para garantizar que siempre se escuche."""
+        text.insert(tk.END, manual_content)
+        text.config(state=tk.DISABLED)
+        
+    def ocultar_ventana(self):
+        self.root.withdraw()
+        
+    def mostrar_ventana(self):
+        # Recargar valores actuales
+        self.val_umbral.set(self.umbral)
+        self.val_rep.set(self.repeticiones)
+        self.val_audio.set(os.path.basename(self.audio_personalizado))
+        self._actualizar_lbl_umbral()
+        self._actualizar_lbl_rep()
+        self.root.deiconify()
+        self.root.lift()
+        
+    def _verificar_cola(self):
+        try:
+            msg = self.cola_gui.get_nowait()
+            if msg == "SHOW":
+                self.mostrar_ventana()
+            elif msg == "QUIT":
+                self.corriendo = False
+                self.root.quit()
+                self.root.destroy()
+                return
+        except queue.Empty:
+            pass
+        self.root.after(100, self._verificar_cola)
 
     def cargar_configuracion(self):
         if os.path.exists(CONFIG_FILE):
             try:
-                with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                    self.umbral = data.get('umbral', 60)
-                    self.audio_personalizado = data.get('audio', DEFAULT_AUDIO)
-                    self.repeticiones = data.get('repeticiones', 1)
-                self.iniciar()
+                    self.umbral = data.get("umbral", 5)
+                    self.audio_personalizado = data.get("audio", DEFAULT_AUDIO)
+                    self.repeticiones = data.get("repeticiones", 1)
             except Exception as e:
-                logging.error(f"Error al leer config.json: {e}")
-                self.mostrar_configuracion()
-        else:
-            self.mostrar_configuracion()
+                logging.error(f"Error al cargar config: {e}")
 
-    def guardar_configuracion(self, umbral, audio, repeticiones):
-        self.umbral = umbral
-        self.audio_personalizado = audio
-        self.repeticiones = repeticiones
-        try:
-            with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-                json.dump({
-                    'umbral': self.umbral,
-                    'audio': self.audio_personalizado,
-                    'repeticiones': self.repeticiones
-                }, f, indent=4)
-        except Exception as e:
-            logging.error(f"Error al guardar config.json: {e}")
+    def on_move(self, x, y):
+        self.ultimo_movimiento = time.time()
+        if self.alarma_activa:
+            self.alarma_activa = False
+            self.detener_sonido()
 
-    def mostrar_configuracion(self, icon=None, item=None):
-        def guardar():
-            try:
-                u = int(entry_umbral.get())
-                r = int(scale_rep.get())
-                a = var_audio.get()
-                if not os.path.exists(a):
-                    a = DEFAULT_AUDIO
-                self.guardar_configuracion(u, a, r)
-                root.destroy()
-                if not self.corriendo:
-                    self.iniciar()
-            except ValueError:
-                messagebox.showerror("Error", "El umbral debe ser un número entero.")
+    def on_click(self, x, y, button, pressed):
+        self.ultimo_movimiento = time.time()
+        if self.alarma_activa:
+            self.alarma_activa = False
+            self.detener_sonido()
 
-        def seleccionar_audio():
-            filepath = filedialog.askopenfilename(
-                title="Seleccionar sonido",
-                filetypes=(("Archivos de audio", "*.mp3 *.wav"), ("Todos los archivos", "*.*"))
-            )
-            if filepath:
-                var_audio.set(filepath)
-
-        root = tk.Tk()
-        root.title("Configuración - MouseGuard")
-        root.geometry("450x380")
-        root.resizable(False, False)
-        
-        try:
-            root.iconbitmap(ICON_PATH)
-        except:
-            pass
-
-        frame = ttk.Frame(root, padding=20)
-        frame.pack(fill=tk.BOTH, expand=True)
-
-        # Umbral
-        ttk.Label(frame, text="Tiempo de inactividad (segundos):").pack(anchor=tk.W)
-        entry_umbral = ttk.Entry(frame)
-        entry_umbral.insert(0, str(self.umbral))
-        entry_umbral.pack(fill=tk.X, pady=(0, 15))
-
-        # Audio
-        ttk.Label(frame, text="Archivo de Sonido:").pack(anchor=tk.W)
-        var_audio = tk.StringVar(value=self.audio_personalizado)
-        audio_frame = ttk.Frame(frame)
-        audio_frame.pack(fill=tk.X, pady=(0, 15))
-        ttk.Entry(audio_frame, textvariable=var_audio, state='readonly').pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
-        ttk.Button(audio_frame, text="Examinar...", command=seleccionar_audio).pack(side=tk.RIGHT)
-
-        # Repeticiones
-        ttk.Label(frame, text="Intensidad de repeticiones (Para sonidos cortos):").pack(anchor=tk.W)
-        scale_rep = tk.Scale(frame, from_=1, to=20, orient=tk.HORIZONTAL)
-        scale_rep.set(self.repeticiones)
-        scale_rep.pack(fill=tk.X, pady=(0, 20))
-
-        ttk.Button(frame, text="Guardar y Ejecutar", command=guardar).pack(fill=tk.X, pady=10)
-        
-        # Centrar
-        root.update_idletasks()
-        x = (root.winfo_screenwidth() // 2) - (450 // 2)
-        y = (root.winfo_screenheight() // 2) - (380 // 2)
-        root.geometry(f"+{x}+{y}")
-        
-        root.mainloop()
+    def on_scroll(self, x, y, dx, dy):
+        self.ultimo_movimiento = time.time()
+        if self.alarma_activa:
+            self.alarma_activa = False
+            self.detener_sonido()
 
     def maximizar_volumen(self):
         try:
-            import ctypes
             VK_VOLUME_UP = 0xAF
             for _ in range(50):
                 ctypes.windll.user32.keybd_event(VK_VOLUME_UP, 0, 0, 0)
                 ctypes.windll.user32.keybd_event(VK_VOLUME_UP, 0, 2, 0)
             logging.info("Volumen del sistema maximizado al 100%.")
         except Exception as e:
-            logging.error(f"Error al maximizar volumen: {e}")
+            logging.error(f"No se pudo maximizar el volumen: {e}")
 
-    def al_evento_mouse(self, *args):
-        self.ultimo_movimiento = time.time()
-
-    def emitir_sonido(self):
-        self.maximizar_volumen()
-        
-        audio = self.audio_personalizado
-        if not os.path.exists(audio):
-            audio = DEFAULT_AUDIO
-            
-        for _ in range(self.repeticiones):
-            if not self.corriendo:
-                break
-            try:
-                from comtypes import CoInitialize
-                import comtypes.client
-                CoInitialize()
-                wmp = comtypes.client.CreateObject("WMPlayer.OCX")
-                wmp.URL = os.path.abspath(audio)
-                wmp.controls.play()
-                
-                time.sleep(0.5)
-                # 3=Playing, 6=Buffering, 9=Transitioning, 10=Ready
-                while wmp.playState in (3, 6, 9, 10):
-                    if not self.corriendo:
-                        wmp.controls.stop()
-                        break
-                    time.sleep(0.1)
-            except Exception as e:
-                logging.error(f"Error reproduciendo audio: {e}")
-                self._sonido_fallback()
-
-    def _sonido_fallback(self):
+    def detener_sonido(self):
         try:
-            import winsound
-            winsound.PlaySound('SystemHand', winsound.SND_ALIAS | winsound.SND_SYNC)
+            ctypes.windll.winmm.mciSendStringW('stop myaudio', None, 0, None)
+            ctypes.windll.winmm.mciSendStringW('close myaudio', None, 0, None)
         except:
             pass
 
-    def _bucle_monitoreo(self):
-        try:
-            while self.corriendo:
-                tiempo_actual = time.time()
-                tiempo_inactivo = tiempo_actual - self.ultimo_movimiento
-
-                if tiempo_inactivo > self.umbral:
-                    logging.warning(f"ALERTA DETONADA: ¡MOUSE OLVIDADO! ({int(tiempo_inactivo)}s de inactividad)")
-                    self.emitir_sonido()
-                    
-                    self.ultimo_movimiento = time.time()
-                    logging.info("Alarma finalizada. Monitoreo reanudado...")
-
-                time.sleep(1)
-        except Exception as e:
-            logging.error(f"Error en bucle de monitoreo: {e}")
-
-    def iniciar(self):
-        if self.corriendo:
+    def emitir_sonido(self):
+        self.maximizar_volumen()
+        audio = self.audio_personalizado
+        if not audio or not os.path.exists(audio):
+            import winsound
+            for _ in range(self.repeticiones):
+                if not self.alarma_activa: break
+                winsound.PlaySound("SystemHand", winsound.SND_ALIAS | winsound.SND_SYNC)
             return
             
-        logging.info("Iniciando MouseGuard...")
-        logging.info(f"Umbral de disparo: {self.umbral} segundos de inactividad.")
-
-        try:
-            self.listener = mouse.Listener(
-                on_move=self.al_evento_mouse,
-                on_click=self.al_evento_mouse,
-                on_scroll=self.al_evento_mouse
-            )
-            self.listener.start()
-        except Exception as e:
-            logging.error(f"Fallo al iniciar la lectura del dispositivo: {e}")
-            sys.exit(1)
-
-        self.ultimo_movimiento = time.time()
-        self.corriendo = True
-
-        if self.use_tray:
-            logging.info("Modo System Tray (Bandeja del sistema).")
-            hilo_monitoreo = threading.Thread(target=self._bucle_monitoreo, daemon=True)
-            hilo_monitoreo.start()
-            return True
-        else:
-            print("==================================================")
-            print("       SISTEMA DE SEGURIDAD DE HARDWARE ACTIVO    ")
-            print("==================================================")
-            print("[*] Presiona Ctrl+C en esta ventana para detener.\n")
+        audio_path = os.path.abspath(audio)
+        for _ in range(self.repeticiones):
+            if not self.corriendo or not self.alarma_activa:
+                break
             try:
-                self._bucle_monitoreo()
-            except KeyboardInterrupt:
-                self.detener()
-            return False
-
-    def detener(self, icon=None, item=None):
-        logging.info("Secuencia de apagado iniciada. Deteniendo listener...")
-        self.corriendo = False
-        if self.listener:
-            self.listener.stop()
-        if icon:
-            icon.stop()
-        logging.info("Sistema detenido exitosamente.")
-        if not self.use_tray:
-            sys.exit(0)
-
-    def _iniciar_tray(self):
-        try:
-            image = Image.open(ICON_PATH)
-        except:
-            image = Image.new('RGB', (64, 64), color=(0, 120, 215))
-            
-        menu = pystray.Menu(
-            pystray.MenuItem("Configuración", self.mostrar_configuracion),
-            pystray.MenuItem("Salir", self.detener)
-        )
-        import threading
-        import time
-        def run_tray():
-            icon = pystray.Icon("MouseGuard", image, "MouseGuard", menu)
-            icon.run()
-            
-        tray_thread = threading.Thread(target=run_tray, daemon=True)
-        tray_thread.start()
-        
-        # Mantener el hilo principal vivo
+                self.detener_sonido()
+                cmd_open = f'open "{audio_path}" type mpegvideo alias myaudio'
+                res = ctypes.windll.winmm.mciSendStringW(cmd_open, None, 0, None)
+                if res != 0:
+                    cmd_open = f'open "{audio_path}" alias myaudio'
+                    ctypes.windll.winmm.mciSendStringW(cmd_open, None, 0, None)
+                    
+                ctypes.windll.winmm.mciSendStringW('play myaudio', None, 0, None)
+                
+                buf = ctypes.create_unicode_buffer(128)
+                while self.alarma_activa and self.corriendo:
+                    ctypes.windll.winmm.mciSendStringW('status myaudio mode', buf, 128, None)
+                    if buf.value != 'playing':
+                        break
+                    time.sleep(0.1)
+                    
+                self.detener_sonido()
+            except Exception as e:
+                logging.error(f"Error reproduciendo audio: {e}")
+                
+    def _bucle_monitoreo(self):
         while self.corriendo:
-            time.sleep(1)
+            if not self.alarma_activa:
+                inactividad = time.time() - self.ultimo_movimiento
+                if inactividad >= self.umbral:
+                    self.alarma_activa = True
+                    self.emitir_sonido()
+            time.sleep(0.5)
 
-def main():
-    parser = argparse.ArgumentParser(description="MouseGuard: Sistema de Seguridad de Hardware.")
-    parser.add_argument("--console", action="store_true", help="Ejecutar mostrando la consola")
-    args = parser.parse_args()
-    
-    guard = MouseGuard(use_console=args.console)
-    
-    if not guard.corriendo:
-        sys.exit(0)
+    def _bucle_tray(self):
+        try:
+            if os.path.exists(ICON_PATH):
+                image = Image.open(ICON_PATH)
+            else:
+                image = Image.new('RGB', (64, 64), color='red')
+                
+            menu = pystray.Menu(
+                pystray.MenuItem("Configuración...", lambda: self.cola_gui.put("SHOW")),
+                pystray.MenuItem("Salir", self._on_salir)
+            )
+            self.icon = pystray.Icon("MouseGuard", image, "MouseGuard Activo", menu)
+            self.icon.run()
+        except Exception as e:
+            logging.error(f"Error en System Tray: {e}")
+            
+    def _on_salir(self):
+        self.corriendo = False
+        if hasattr(self, 'icon'):
+            self.icon.stop()
+        self.cola_gui.put("QUIT")
         
-    if guard.use_tray:
-        guard._iniciar_tray()
+    def run(self):
+        # El hilo principal es el de la GUI (Tkinter)
+        self.root.mainloop()
 
 if __name__ == "__main__":
-    main()
+    app = MouseGuardApp()
+    app.run()
