@@ -17,9 +17,10 @@ except ImportError:
     HAS_TRAY = False
 
 try:
-    from playsound import playsound
+    import comtypes.client
+    from comtypes import CoInitialize
 except ImportError:
-    playsound = None
+    pass
 
 try:
     from ctypes import cast, POINTER
@@ -61,7 +62,9 @@ class MouseGuard:
         logging.basicConfig(
             level=logging.INFO,
             format='%(asctime)s [%(levelname)s] %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S'
+            datefmt='%Y-%m-%d %H:%M:%S',
+            filename='mouseguard_debug.log',
+            filemode='a'
         )
 
     def cargar_configuracion(self):
@@ -160,13 +163,12 @@ class MouseGuard:
         root.mainloop()
 
     def maximizar_volumen(self):
-        if not HAS_PYCAW:
-            return
         try:
-            devices = AudioUtilities.GetSpeakers()
-            interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-            volume = cast(interface, POINTER(IAudioEndpointVolume))
-            volume.SetMasterVolumeLevelScalar(1.0, None) # 1.0 es 100%
+            import ctypes
+            VK_VOLUME_UP = 0xAF
+            for _ in range(50):
+                ctypes.windll.user32.keybd_event(VK_VOLUME_UP, 0, 0, 0)
+                ctypes.windll.user32.keybd_event(VK_VOLUME_UP, 0, 2, 0)
             logging.info("Volumen del sistema maximizado al 100%.")
         except Exception as e:
             logging.error(f"Error al maximizar volumen: {e}")
@@ -184,13 +186,23 @@ class MouseGuard:
         for _ in range(self.repeticiones):
             if not self.corriendo:
                 break
-            if playsound and os.path.exists(audio):
-                try:
-                    playsound(audio)
-                except Exception as e:
-                    logging.error(f"Error playsound: {e}")
-                    self._sonido_fallback()
-            else:
+            try:
+                from comtypes import CoInitialize
+                import comtypes.client
+                CoInitialize()
+                wmp = comtypes.client.CreateObject("WMPlayer.OCX")
+                wmp.URL = os.path.abspath(audio)
+                wmp.controls.play()
+                
+                time.sleep(0.5)
+                # 3=Playing, 6=Buffering, 9=Transitioning, 10=Ready
+                while wmp.playState in (3, 6, 9, 10):
+                    if not self.corriendo:
+                        wmp.controls.stop()
+                        break
+                    time.sleep(0.1)
+            except Exception as e:
+                logging.error(f"Error reproduciendo audio: {e}")
                 self._sonido_fallback()
 
     def _sonido_fallback(self):
@@ -275,8 +287,18 @@ class MouseGuard:
             pystray.MenuItem("Configuración", self.mostrar_configuracion),
             pystray.MenuItem("Salir", self.detener)
         )
-        icon = pystray.Icon("MouseGuard", image, "MouseGuard", menu)
-        icon.run()
+        import threading
+        import time
+        def run_tray():
+            icon = pystray.Icon("MouseGuard", image, "MouseGuard", menu)
+            icon.run()
+            
+        tray_thread = threading.Thread(target=run_tray, daemon=True)
+        tray_thread.start()
+        
+        # Mantener el hilo principal vivo
+        while self.corriendo:
+            time.sleep(1)
 
 def main():
     parser = argparse.ArgumentParser(description="MouseGuard: Sistema de Seguridad de Hardware.")

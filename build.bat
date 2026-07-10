@@ -9,4 +9,3 @@ python -m PyInstaller --noconsole --onefile --icon="icon.ico" --add-data "purge_
 
 echo.
 echo Compilacion terminada. Revisa la carpeta 'dist'.
-pause

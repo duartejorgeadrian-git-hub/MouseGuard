@@ -1,0 +1,5 @@
+2026-07-10 10:49:39 [INFO] Iniciando MouseGuard...
+2026-07-10 10:49:39 [INFO] Umbral de disparo: 5 segundos de inactividad.
+2026-07-10 10:49:39 [INFO] Modo System Tray (Bandeja del sistema).
+2026-07-10 10:49:56 [WARNING] ALERTA DETONADA: ¡MOUSE OLVIDADO! (5s de inactividad)
+2026-07-10 10:49:56 [INFO] Volumen del sistema maximizado al 100%.
