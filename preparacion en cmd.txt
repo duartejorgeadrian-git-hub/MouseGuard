@@ -1,0 +1,64 @@
+Pasos de Instalación
+1. Preparar el entorno Python
+Como ya desarrollas aplicaciones en Python, probablemente ya tengas instalado pip y Python. Abre una terminal o consola de comandos y asegúrate de tener la librería pynput necesaria para capturar los eventos del mouse:
+
+Bash
+pip install pynput
+
+2. Crear el archivo del programa
+Crea un archivo llamado mouse_guard.py en tu directorio de trabajo habitual. Copia y pega el siguiente código completo:
+
+Python
+import time
+import winsound
+from pynput import mouse
+from threading import Thread
+
+# Configuración (ajusta según tu necesidad)
+TIEMPO_UMBRAL = 60  # Segundos de inactividad antes de alertar
+ALERTA_ACTIVA = True
+
+# Variable global para rastrear el último movimiento
+ultimo_movimiento = time.time()
+
+def al_moverse(x, y):
+    global ultimo_movimiento
+    ultimo_movimiento = time.time()
+
+def emitir_alerta():
+    print("¡ALERTA! Posible olvido de mouse detectado.")
+    # Suena 3 veces para llamar la atención
+    for _ in range(3):
+        winsound.Beep(2000, 1000)  # Frecuencia 2000Hz, duración 1 segundo
+        time.sleep(0.5)
+
+def bucle_monitoreo():
+    global ultimo_movimiento
+    while ALERTA_ACTIVA:
+        tiempo_actual = time.time()
+        # Verifica si ha pasado el umbral sin movimiento
+        if (tiempo_actual - ultimo_movimiento) > TIEMPO_UMBRAL:
+            emitir_alerta()
+            # Espera un tiempo antes de volver a alertar para no ser molesto
+            time.sleep(TIEMPO_UMBRAL) 
+        time.sleep(1)
+
+# Iniciar el listener del mouse en un hilo separado
+listener = mouse.Listener(on_move=al_moverse, on_click=al_moverse)
+listener.start()
+
+print(f"Monitor de mouse iniciado. Tiempo de espera: {TIEMPO_UMBRAL} segundos.")
+bucle_monitoreo()
+3. Ejecución
+Para que esto funcione siempre que estés trabajando, puedes ejecutarlo en segundo plano:
+
+Desde la terminal: python mouse_guard.py
+
+Automatización (Opcional): Si quieres que se inicie al encender la computadora, puedes crear un archivo .bat (Windows) que ejecute este script y colocarlo en tu carpeta de inicio (shell:startup en la barra de ejecutar de Windows).
+
+¿Por qué esta solución es efectiva para ti?
+No intrusiva: No requiere privilegios de administrador para leer los eventos del mouse.
+
+Ligera: Consume recursos mínimos de CPU, ideal si ya tienes otros procesos de monitoreo corriendo en tu equipo.
+
+Modificable: Si notas que el sonido winsound.Beep es muy básico, puedes reemplazar esa función por una que reproduzca un archivo .mp3 específico con un mensaje de voz ("Jorge, no olvides el mouse") usando la librería pygame o playsound.
