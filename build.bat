@@ -1,9 +1,12 @@
 @echo off
-echo Instalando PyInstaller...
-pip install pyinstaller
+echo Limpiando compilaciones anteriores...
+rmdir /s /q build
+rmdir /s /q dist
+del /q *.spec
 
-echo Compilando MouseGuard.exe...
-pyinstaller --noconsole --onefile mouse_guard.py
+echo Compilando MouseGuard v2.0...
+python -m PyInstaller --noconsole --onefile --icon="icon.ico" --add-data "purge_siren.mp3;." --add-data "icon.ico;." mouse_guard.py
 
-echo Proceso terminado. Encontraras el ejecutable en la carpeta "dist".
+echo.
+echo Compilacion terminada. Revisa la carpeta 'dist'.
 pause
